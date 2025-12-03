@@ -2,7 +2,7 @@ from pathlib import Path
 import os
 
 from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask_cors import CORS, cross_origin
 from werkzeug.utils import secure_filename
 
 # Import the helper and label names from your inference module
@@ -11,8 +11,9 @@ from inference_running_functions import run_inference_on_video, LABEL_NAMES
 # 1. Create the Flask app
 app = Flask(__name__)
 
-# 2. Enable CORS so Framer (different domain) can call this API
-CORS(app)
+# Allow all origins on all routes
+CORS(app, resources={r"/*": {"origins": "*"}})
+
 
 # 3. Directory where we'll temporarily save uploaded videos
 #    /tmp is a standard writable temp folder on Linux (Render uses Linux containers)
@@ -24,6 +25,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # Health-check endpoint
 # -------------------------
 @app.route("/health", methods=["GET"])
+@cross_origin()  # explicitly add CORS headers on this route
 def health():
     """
     Health-check endpoint.
@@ -53,6 +55,7 @@ def index():
 # Main inference endpoint
 # -------------------------
 @app.route("/analyze", methods=["POST"])
+@cross_origin()  # explicitly add CORS headers on this route
 def analyze():
     """
     Main endpoint used by Framer / clients.
