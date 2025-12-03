@@ -11,12 +11,15 @@ from inference_running_functions import run_inference_on_video, LABEL_NAMES
 # 1. Create the Flask app
 app = Flask(__name__)
 
-# Allow all origins on all routes
-CORS(app, resources={r"/*": {"origins": "*"}})
-
+# 2. Enable CORS on ALL routes, for ALL origins (no credentials)
+#    This will let requests from framer.com, framercanvas.com, framer.app, etc.
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=False,
+)
 
 # 3. Directory where we'll temporarily save uploaded videos
-#    /tmp is a standard writable temp folder on Linux (Render uses Linux containers)
 UPLOAD_DIR = Path("/tmp/videos")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -25,14 +28,14 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # Health-check endpoint
 # -------------------------
 @app.route("/health", methods=["GET"])
-@cross_origin()  # explicitly add CORS headers on this route
+@cross_origin(origins="*", send_wildcard=True)
 def health():
     """
     Health-check endpoint.
 
     Use this to verify that:
       - The Flask app is running.
-      - The route is registered correctly.
+      - CORS headers are being sent.
     """
     return jsonify({"status": "ok"})
 
@@ -41,21 +44,24 @@ def health():
 # Root endpoint (optional)
 # -------------------------
 @app.route("/", methods=["GET"])
+@cross_origin(origins="*", send_wildcard=True)
 def index():
     """
     Simple index route so visiting the bare URL doesn't show a 404.
 
     Example:
-      http://127.0.0.1:5000/
+      https://running-form-analysis.onrender.com/
     """
-    return jsonify({"message": "Running Form API is alive. Use POST /analyze to analyze a video."})
+    return jsonify(
+        {"message": "Running Form API is alive. Use POST /analyze to analyze a video."}
+    )
 
 
 # -------------------------
 # Main inference endpoint
 # -------------------------
 @app.route("/analyze", methods=["POST"])
-@cross_origin()  # explicitly add CORS headers on this route
+@cross_origin(origins="*", send_wildcard=True)
 def analyze():
     """
     Main endpoint used by Framer / clients.
@@ -64,11 +70,6 @@ def analyze():
       - HTTP method: POST
       - Content-Type: multipart/form-data
       - A single file field named 'video' containing the uploaded video.
-
-    Behavior:
-      - Saves the uploaded video to /tmp/videos.
-      - Calls run_inference_on_video() from your inference module.
-      - Builds a JSON object with probabilities and predicted labels.
 
     Returns:
       - On success: JSON like:
@@ -90,37 +91,32 @@ def analyze():
     if file.filename == "":
         return jsonify({"error": "Uploaded file has an empty filename."}), 400
 
-    # 3. Sanitize the filename (removes dangerous characters, relative paths, etc.)
+    # 3. Sanitize the filename and save to /tmp
     filename = secure_filename(file.filename)
-
-    # 4. Save the file to the temporary directory
     save_path = UPLOAD_DIR / filename
     file.save(save_path)
 
     try:
-        # 5. Run your existing inference pipeline on the saved file
+        # 4. Run your existing inference pipeline on the saved file
         probs, preds = run_inference_on_video(save_path)
     except Exception as e:
-        # If anything goes wrong in the pipeline, return an error to the client.
-        # In a real deployment you'd also log this for debugging.
+        # Return 500 with error message if inference fails
         return jsonify({"error": f"Inference failed: {str(e)}"}), 500
     finally:
-        # 6. Clean up: remove the video file to save space.
+        # 5. Clean up: remove the video file to save space
         try:
             os.remove(save_path)
         except OSError:
-            # If deletion fails, we just ignore the error.
             pass
 
-    # 7. Build a dictionary to return as JSON
+    # 6. Build JSON result
     result = {}
     for name in LABEL_NAMES:
         result[name] = {
-            "prob": float(probs[name]),   # ensure it's a plain Python float
-            "label": int(preds[name]),    # ensure it's a plain Python int (0 or 1)
+            "prob": float(probs[name]),
+            "label": int(preds[name]),
         }
 
-    # 8. Send the JSON response back to the client (Framer frontend)
     return jsonify(result)
 
 
@@ -128,7 +124,7 @@ def analyze():
 # Local dev entry point
 # -------------------------
 if __name__ == "__main__":
-    # This allows you to run the Flask app locally for testing:
-    #   python app.py
-    # Visit http://127.0.0.1:5000/health to test.
+    # Run locally with:
+    #   python webrun.py
+    # then visit http://127.0.0.1:5000/health
     app.run(host="0.0.0.0", port=5000, debug=True)
