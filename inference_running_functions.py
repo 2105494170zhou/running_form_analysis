@@ -33,6 +33,9 @@ import xgboost as xgb  # needed so XGB models can be unpickled, even if not used
 
 mp_pose = mp.solutions.pose
 
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
 
 def extract_pose_from_video(video_path: Path) -> pd.DataFrame:
     """

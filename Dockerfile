@@ -1,5 +1,5 @@
 # Use a slim Python image
-FROM python:3.11-slim
+FROM python:3.10.13-slim
 
 # Create working directory
 WORKDIR /app
