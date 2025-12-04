@@ -159,7 +159,7 @@ def load_models_per_label(model_dir: Path,
     # Adjust names here if your filenames differ.
     # Keys in this dict must match LABEL_NAMES below.
     model_paths = {
-        "overstriding":      model_dir / "rf_overstriding.pkl",
+        "overstriding":      model_dir / "xgb_overstriding.pkl",
         "hard_landing":      model_dir / "rf_hard_landing.pkl",
         "forward_lean":      model_dir / "rf_forward_lean.pkl",
         "little_propulsion": model_dir / "xgb_little_propulsion.pkl",
