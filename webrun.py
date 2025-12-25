@@ -1,116 +1,113 @@
-from pathlib import Path
-import os
 
-from flask import Flask, request, jsonify
+import os
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS, cross_origin
 from werkzeug.utils import secure_filename
 
-# Import your inference helper and label names
-from inference_running_functions import run_inference_on_video, LABEL_NAMES
+from inference_running_functions import LABEL_NAMES, run_inference_and_overlay
 
-# -----------------------------------------------------------------------------
+# Config
+MODEL_REPO = os.getenv("HF_MODEL_REPO", "adkjfbskd/running_form_model")
+
+UPLOAD_DIR = Path("/tmp/videos")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+OVERLAY_DIR = Path("/tmp/overlays")
+OVERLAY_DIR.mkdir(parents=True, exist_ok=True)
+
+
 # App setup
-# -----------------------------------------------------------------------------
+
 app = Flask(__name__)
 
-# Global CORS config: allow ALL origins on ALL routes (no credentials)
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
     supports_credentials=False,
 )
 
-# Temp directory for uploaded videos
-UPLOAD_DIR = Path("/tmp/videos")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# -----------------------------------------------------------------------------
 # Routes
-# -----------------------------------------------------------------------------
+
 @app.route("/health", methods=["GET"])
-@cross_origin()  # make sure CORS headers are applied
+@cross_origin()
 def health():
-    """
-    Simple health check endpoint.
-    """
     return jsonify({"status": "ok"})
 
 
 @app.route("/", methods=["GET"])
 @cross_origin()
 def index():
-    """
-    Root endpoint so hitting the bare URL returns something useful.
-    """
-    return jsonify(
-        {
-            "message": "Running Form API is alive. Use POST /analyze with a 'video' file."
-        }
-    )
+    return jsonify({"message": "Running Form API is alive. Use POST /analyze with a 'video' file."})
 
 
 @app.route("/analyze", methods=["POST"])
 @cross_origin()
 def analyze():
-    """
-    Main endpoint used by Framer.
-
-    Expects:
-      - POST /analyze
-      - Content-Type: multipart/form-data
-      - A single file field named 'video' containing the uploaded video.
-
-    Returns:
-      - On success: JSON of probabilities and labels for each running-form issue.
-      - On error: JSON with 'error' and appropriate HTTP status code.
-    """
-    # 1. Check the 'video' file is present
     if "video" not in request.files:
         return jsonify({"error": "No file field named 'video' in the request."}), 400
 
     file = request.files["video"]
-
-    # 2. Basic validation of filename
     if not file.filename:
         return jsonify({"error": "Uploaded file has an empty filename."}), 400
 
-    # 3. Sanitize filename and save to /tmp/videos
     filename = secure_filename(file.filename)
     save_path = UPLOAD_DIR / filename
     file.save(save_path)
 
+    height_m = 1.70
+    height_str = request.form.get("height_m")
+    if height_str is not None:
+        try:
+            height_m = float(height_str)
+        except ValueError:
+            pass 
+
+    # Output overlay (WebM)
+    overlay_name = f"{save_path.stem}_overlay.webm"
+    overlay_path = OVERLAY_DIR / overlay_name
+
     try:
-        # 4. Run your existing inference pipeline
-        probs, preds = run_inference_on_video(save_path)
+        probs, preds, frame_count, fps, metrics = run_inference_and_overlay(
+            video_path=save_path,
+            model_repo=MODEL_REPO,
+            overlay_path=overlay_path,
+            scale=0.7,
+            height_m=height_m,
+        )
     except Exception as e:
-        # Log to server stdout for debugging on Render
-        print(f"[ERROR] Inference failed for {save_path}: {e}", flush=True)
+        print(f"[ERROR] Inference/overlay failed for {save_path}: {e}", flush=True)
         return jsonify({"error": f"Inference failed: {str(e)}"}), 500
     finally:
-        # 5. Clean up temporary file
         try:
             os.remove(save_path)
         except OSError:
             pass
 
-    # 6. Build JSON result in a Framer-friendly format
-    result = {
-        name: {
-            "prob": float(probs[name]),
-            "label": int(preds[name]),
-        }
-        for name in LABEL_NAMES
-    }
+    result = {}
+    for name in LABEL_NAMES:
+        result[name] = {"prob": float(probs[name]), "label": int(preds[name])}
+
+    base = request.url_root.rstrip("/")
+    if base.startswith("http://"):
+        base = "https://" + base[len("http://"):]
+    result["_video_url"] = f"{base}/video/{overlay_name}"
+
+    result["_frame_count"] = int(frame_count)
+    result["_fps"] = float(fps)
+    result["_metrics"] = metrics
 
     return jsonify(result)
 
 
-# -----------------------------------------------------------------------------
-# Local dev entry point
-# -----------------------------------------------------------------------------
+@app.route("/video/<path:filename>", methods=["GET"])
+@cross_origin()
+def get_video(filename):
+    """Serve processed overlay video files."""
+    return send_from_directory(OVERLAY_DIR, filename, mimetype="video/webm")
+
+
 if __name__ == "__main__":
-    # For local testing:
-    #   python webrun.py
-    # Then open http://127.0.0.1:5000/health in your browser.
     app.run(host="0.0.0.0", port=5000, debug=True)
