@@ -5,7 +5,7 @@ A video-based running form analysis system that:
 2) computes **kinematic running metrics**,
 3) runs **ML classifiers** to flag common form issues,
 4) returns a JSON report **plus an overlay video** with pose landmarks.
-5) Public website powered by **Framer** frontend and **Hugging Face** backend program:[runningform.framer.website](https://runningform.framer.website)
+5) Public website powered by **Framer** frontend and **Hugging Face** backend program: [runningform.framer.website](https://runningform.framer.website)
 
 
 ---
