@@ -1,49 +1,48 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 
-"""
-Inference script for running-form classification using 4 separate ML models
-(one per label).
-
-The models can be of different types (e.g. RandomForest, XGBoost, etc.) as long
-as they implement a scikit-learn style API with .predict_proba().
-
-Usage:
-    python inference_running.py --video "D:\\path\\to\\video.mp4"
-
-Requirements:
-    pip install mediapipe opencv-python pandas numpy scikit-learn xgboost joblib
-"""
-
-import argparse
+import json
+import tempfile
 from pathlib import Path
-from typing import Dict, Tuple, List, Any
 
 import cv2
 import mediapipe as mp
 import numpy as np
 import pandas as pd
 import joblib
-import xgboost as xgb  # needed so XGB models can be unpickled, even if not used directly
+import xgboost as xgb
+from huggingface_hub import hf_hub_download
+from mediapipe.framework.formats import landmark_pb2
+
+from running_metrics_extraction_4 import process_single_csv
 
 
-# ===============================
-# MediaPipe pose extraction
-# ===============================
+
+# Constants
+
+
+LABEL_NAMES = ["overstriding", "hard_landing", "forward_lean", "little_propulsion"]
+
+
+FEATURE_DIM = 132
+
+MODEL_FILENAMES = {
+    "overstriding": "xgb_overstriding.pkl",
+    "hard_landing": "rf_hard_landing.pkl",
+    "forward_lean": "rf_forward_lean.pkl",
+    "little_propulsion": "xgb_little_propulsion.pkl",
+}
+
+_MODELS_CACHE = {}
+_LOADED_REPO_ID = None
+
+# MediaPipe setup
+
 
 mp_pose = mp.solutions.pose
-
 mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+mp_styles = mp.solutions.drawing_styles
 
 
-def extract_pose_from_video(video_path: Path) -> pd.DataFrame:
-    """
-    Run MediaPipe Pose on a video and return a long-format DataFrame:
-        columns: frame_index, landmark_id, x_norm, y_norm, z_norm, visibility
-
-    Each row corresponds to ONE landmark in ONE frame.
-    """
+def extract_pose_from_video(video_path):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -53,245 +52,260 @@ def extract_pose_from_video(video_path: Path) -> pd.DataFrame:
 
     with mp_pose.Pose(
         static_image_mode=False,
-        model_complexity=1,
+        model_complexity=2,
         enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.6,
     ) as pose:
 
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            ok, frame = cap.read()
+            if not ok:
                 break
 
-            h, w, _ = frame.shape
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = pose.process(image_rgb)
+            h, w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = pose.process(rgb)
 
             if result.pose_landmarks:
-                # We have a pose detection for this frame
                 for lm_id, lm in enumerate(result.pose_landmarks.landmark):
-                    rows.append({
-                        "frame_index": frame_idx,
-                        "landmark_id": lm_id,
-                        "x_norm": lm.x,
-                        "y_norm": lm.y,
-                        "z_norm": lm.z,
-                        "visibility": lm.visibility,
-                    })
+                    rows.append(
+                        {
+                            "frame_index": frame_idx,
+                            "landmark_id": lm_id,
+                            "x_norm": lm.x,
+                            "y_norm": lm.y,
+                            "z_norm": lm.z,
+                            "visibility": lm.visibility,
+                            "x_px": lm.x * w,
+                            "y_px": lm.y * h,
+                        }
+                    )
             else:
-                # No detection in this frame: fill with NaN so we know it's missing
-                for lm_id in range(33):  # MediaPipe Pose has 33 landmarks
-                    rows.append({
-                        "frame_index": frame_idx,
-                        "landmark_id": lm_id,
-                        "x_norm": np.nan,
-                        "y_norm": np.nan,
-                        "z_norm": np.nan,
-                        "visibility": np.nan,
-                    })
+                for lm_id in range(33):
+                    rows.append(
+                        {
+                            "frame_index": frame_idx,
+                            "landmark_id": lm_id,
+                            "x_norm": np.nan,
+                            "y_norm": np.nan,
+                            "z_norm": np.nan,
+                            "visibility": np.nan,
+                            "x_px": np.nan,
+                            "y_px": np.nan,
+                        }
+                    )
 
             frame_idx += 1
 
     cap.release()
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
-# ===============================
-# Preprocessing: pivot + cleaning + frame mask
-# ===============================
+def generate_overlay_video_from_df(video_path, output_path, df_pose, scale=0.7):
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
 
-def df_to_sequence_and_mask(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Convert a MediaPipe pose DataFrame into:
-        seq:        [T, F] float32 (no NaNs, NaNs replaced by 0)
-        frame_mask: [T]   float32, 1 = frame has some real data, 0 = no data
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
 
-    Steps:
-      - Check required columns.
-      - Pivot (frame_index, landmark_id) -> frames x (coords x landmarks).
-      - Replace NaNs with 0.0 but keep where frames were all-NaN via frame_mask.
-    """
+    out_w = max(2, int(orig_w * scale))
+    out_h = max(2, int(orig_h * scale))
+    out_w -= out_w % 2
+    out_h -= out_h % 2
+
+    print(f"[OVERLAY] {orig_w}x{orig_h} -> {out_w}x{out_h}", flush=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*"VP80")
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (out_w, out_h))
+    if not out.isOpened():
+        raise RuntimeError(f"Could not open VP8 VideoWriter for {output_path}")
+
+    frame_idx = 0
+    total = 0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        frame_small = cv2.resize(frame, (out_w, out_h))
+
+        frame_df = df_pose[df_pose["frame_index"] == frame_idx]
+        if not frame_df.empty and not frame_df[["x_norm", "y_norm"]].isna().all().all():
+            lms = []
+            for _, row in frame_df.sort_values("landmark_id").iterrows():
+                if np.isnan(row["x_norm"]) or np.isnan(row["y_norm"]):
+                    continue
+                lm = landmark_pb2.NormalizedLandmark(
+                    x=float(row["x_norm"]),
+                    y=float(row["y_norm"]),
+                    z=float(row["z_norm"]) if not np.isnan(row["z_norm"]) else 0.0,
+                    visibility=float(row["visibility"]) if not np.isnan(row["visibility"]) else 0.0,
+                )
+                lms.append(lm)
+
+            if lms:
+                landmark_list = landmark_pb2.NormalizedLandmarkList(landmark=lms)
+                mp_drawing.draw_landmarks(
+                    frame_small,
+                    landmark_list,
+                    mp_pose.POSE_CONNECTIONS,
+                    mp_styles.get_default_pose_landmarks_style(),
+                )
+
+        out.write(frame_small)
+        frame_idx += 1
+        total += 1
+
+    cap.release()
+    out.release()
+
+    print(f"[OVERLAY] Wrote {total} frames at {fps} fps -> {output_path}", flush=True)
+    return total, fps
+
+
+def df_to_sequence_and_mask(df):
     if "frame_index" not in df.columns or "landmark_id" not in df.columns:
-        raise ValueError("DataFrame must contain 'frame_index' and 'landmark_id' columns.")
+        raise ValueError("DataFrame must contain 'frame_index' and 'landmark_id'.")
 
     coord_cols = [c for c in ["x_norm", "y_norm", "z_norm", "visibility"] if c in df.columns]
     if not coord_cols:
         raise ValueError("No coordinate columns found in DataFrame.")
 
-    # Sort and pivot to ensure consistent ordering: frames x features
     df_sorted = df.sort_values(["frame_index", "landmark_id"])
     pivot = df_sorted.pivot_table(index="frame_index", columns="landmark_id", values=coord_cols)
 
-    # Flatten MultiIndex columns to 'x_norm_lm0', 'y_norm_lm0', etc.
     pivot.columns = [f"{coord}_lm{lm}" for coord, lm in pivot.columns]
 
-    seq = pivot.to_numpy(dtype="float32")  # [T, F], may contain NaNs
+    seq = pivot.to_numpy(dtype="float32")
 
-    # frame_mask: 1 if this frame has at least one non-NaN value, else 0
-    frame_has_data = ~np.isnan(seq).all(axis=1)   # [T] bool
-    frame_mask = frame_has_data.astype("float32")
-
-    # Replace NaNs with 0 so no NaNs go into the model
+    mask = (~np.isnan(seq).all(axis=1)).astype("float32")
     seq = np.where(np.isnan(seq), 0.0, seq).astype("float32")
 
-    return seq, frame_mask
+    return seq, mask
 
 
-# ===============================
-# Load 4 separate models (any type)
-# ===============================
+def load_models_from_hub(model_repo):
 
-def load_models_per_label(model_dir: Path,
-                          label_names: List[str]) -> Dict[str, Any]:
-    """
-    Load one ML model per label.
+    global _MODELS_CACHE, _LOADED_REPO_ID
 
-    The models can be different types (RandomForest, XGBoost, etc.) as long as
-    they support .predict_proba() with the scikit-learn API.
+    if _MODELS_CACHE and _LOADED_REPO_ID == model_repo:
+        return _MODELS_CACHE
 
-    Assumes filenames like:
-        rf_overstriding.pkl
-        rf_hard_landing.pkl
-        rf_forward_lean.pkl
-        xgb_little_propulsion.pkl
-    """
-    models: Dict[str, Any] = {}
+    models = {}
+    for label in LABEL_NAMES:
+        filename = MODEL_FILENAMES[label]
+        print(f"[MODEL] Downloading {model_repo}/{filename}", flush=True)
+        local_path = hf_hub_download(repo_id=model_repo, filename=filename)
+        models[label] = joblib.load(local_path)
 
-    # Adjust names here if your filenames differ.
-    # Keys in this dict must match LABEL_NAMES below.
-    model_paths = {
-        "overstriding":      model_dir / "xgb_overstriding.pkl",
-        "hard_landing":      model_dir / "rf_hard_landing.pkl",
-        "forward_lean":      model_dir / "rf_forward_lean.pkl",
-        "little_propulsion": model_dir / "xgb_little_propulsion.pkl",
-    }
-
-    for label in label_names:
-        path = model_paths[label]
-        if not path.exists():
-            raise FileNotFoundError(f"Model file for label '{label}' not found: {path}")
-        print(f"Loading model for '{label}' from: {path}")
-        models[label] = joblib.load(path)
-
+    _MODELS_CACHE = models
+    _LOADED_REPO_ID = model_repo
     return models
 
 
-# ===============================
-# Inference on a single video
-# ===============================
+def predict_video(video_path, models_per_label, df_pose=None):
 
-def predict_video(
-    video_path: Path,
-    models_per_label: Dict[str, Any],
-    label_names: List[str],
-    feature_dim: int,
-) -> Tuple[Dict[str, float], Dict[str, int]]:
-    """
-    Full pipeline for a single video:
-      - MediaPipe pose -> DataFrame
-      - DataFrame -> (seq, frame_mask)
-      - seq/mask -> masked-mean feature vector [1, F]
-      - Run each label's model separately -> probability + binary prediction
+    print(f"\n[INFER] Processing video: {video_path}", flush=True)
 
-    Returns:
-      probs: {label_name -> probability of class 1}
-      preds: {label_name -> 0 or 1}
-    """
-    print(f"\nProcessing video: {video_path}")
-    df_pose = extract_pose_from_video(video_path)
+    if df_pose is None:
+        df_pose = extract_pose_from_video(video_path)
+
     num_frames = df_pose["frame_index"].nunique()
-    print(f"Extracted pose for {num_frames} frames.")
+    print(f"[INFER] Pose extracted for {num_frames} frames", flush=True)
 
     seq, frame_mask = df_to_sequence_and_mask(df_pose)
     T, F = seq.shape
-    print(f"Sequence shape: [T={T}, F={F}]")
+    print(f"[INFER] Sequence shape: T={T}, F={F}", flush=True)
 
-    if F != feature_dim:
-        raise ValueError(f"Feature dim mismatch: got {F}, expected {feature_dim}.")
+    if F != FEATURE_DIM:
+        raise ValueError(f"Feature dim mismatch: got {F}, expected {FEATURE_DIM}")
 
-    # ----- Build masked-mean feature vector (same as training X_features) -----
-    mask = frame_mask.astype("float32")[:, np.newaxis]  # [T, 1]
-
-    # Multiply each frame by its mask (0 or 1) and sum over time
-    X_sum = (seq * mask).sum(axis=0)  # [F]
-    valid_len = mask.sum()
-    if valid_len <= 0:
-        # Fallback: simple mean over time if mask somehow all zeros
+    # masked mean over time
+    mask = frame_mask[:, None]
+    valid = mask.sum()
+    if valid <= 0:
         feats = seq.mean(axis=0)
     else:
-        feats = X_sum / valid_len  # [F]
+        feats = (seq * mask).sum(axis=0) / valid
 
-    # Model expects shape [N, F] even for a single example
-    X_input = feats.reshape(1, -1)  # [1, F]
+    X = feats.reshape(1, -1)
 
-    probs: Dict[str, float] = {}
-    preds: Dict[str, int] = {}
+    probs = {}
+    preds = {}
 
-    for name in label_names:
-        model = models_per_label[name]
+    for label in LABEL_NAMES:
+        model = models_per_label[label]
+        proba = model.predict_proba(X)[0]
 
-        # We assume a scikit-learn style API: predict_proba returns [N, n_classes]
-        proba = model.predict_proba(X_input)[0]  # first (and only) sample
-
-        if proba.shape[0] == 2:
-            # Standard binary case: [P(class 0), P(class 1)]
-            p1 = float(proba[1])   # probability of class 1
-        else:
-            # Degenerate / unusual case:
-            # If there's only one class, scikit-like models often return [1.0].
-            # Here we conservatively treat this as prob=0 for class 1.
-            p1 = 0.0
-
-        probs[name] = p1
-        preds[name] = int(p1 >= 0.5)
+        p1 = float(proba[1]) if len(proba) == 2 else 0.0
+        probs[label] = p1
+        preds[label] = int(p1 >= 0.5)
 
     return probs, preds
 
 
-# ===============================
-# High-level helper for web API
-# ===============================
+def compute_metrics_for_df(df_pose, fps, height_m=1.70):
 
-# These are the label names used inside your code and mapping above
-LABEL_NAMES = ["overstriding", "hard_landing", "forward_lean", "little_propulsion"]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        csv_path = tmpdir / "pose_points.csv"
 
-# 33 MediaPipe landmarks * 4 values (x, y, z, visibility) = 132 features
-FEATURE_DIM = 132
+        df_pose.to_csv(csv_path, index=False)
 
-# Where the .pkl model files are located.
-# In your case, the 4 models are in the SAME folder as this script,
-# so we point to this file's directory.
-MODEL_DIR = Path(__file__).resolve().parent
+        json_path = process_single_csv(
+            csv_path=csv_path,
+            fps=fps,
+            height_m=height_m,
+            coords="norm",
+            vel_thresh=0.0175,
+            vel_thresh_pct=0.0,
+            persist_frames=8,
+            min_step_gap=19,
+            smooth_alpha=0.25,
+            max_interp_gap=3,
+            view="side",
+            out_dir=tmpdir,
+        )
 
-# Load the models ONCE when this module is imported.
-# This way, Flask doesn't have to reload all models on every request.
-MODELS_PER_LABEL = load_models_per_label(MODEL_DIR, LABEL_NAMES)
+        if json_path is None:
+            return {}
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+
+        return obj.get("metrics", {})
 
 
-def run_inference_on_video(video_path: Path):
-    """
-    High-level helper used by the web API or CLI.
+def run_inference_and_overlay(video_path, model_repo, overlay_path, scale=0.7, height_m=1.70):
 
-    Input:
-        video_path: Path to a video file on disk.
+    models = load_models_from_hub(model_repo)
 
-    Behavior:
-        - Runs the full pipeline:
-            MediaPipe pose extraction
-            -> DataFrame -> sequence/mask
-            -> masked mean pooling -> feature vector [1, FEATURE_DIM]
-            -> runs each of the 4 models
+    df_pose = extract_pose_from_video(video_path)
+    frame_count = df_pose["frame_index"].nunique()
+    print(f"[PIPELINE] Extracted pose for {frame_count} frames", flush=True)
 
-    Returns:
-        probs: {label_name: probability of issue (class 1)}
-        preds: {label_name: 0 or 1}
-    """
     probs, preds = predict_video(
         video_path=video_path,
-        models_per_label=MODELS_PER_LABEL,
-        label_names=LABEL_NAMES,
-        feature_dim=FEATURE_DIM,
+        models_per_label=models,
+        df_pose=df_pose,
     )
-    return probs, preds
+
+    _, fps = generate_overlay_video_from_df(
+        video_path=video_path,
+        output_path=overlay_path,
+        df_pose=df_pose,
+        scale=scale,
+    )
+
+    metrics = compute_metrics_for_df(df_pose=df_pose, fps=fps, height_m=height_m)
+
+    return probs, preds, frame_count, fps, metrics
+
+
+def run_inference_on_video(video_path, model_repo):
+    models = load_models_from_hub(model_repo)
+    return predict_video(video_path=video_path, models_per_label=models)
